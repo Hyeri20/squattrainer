@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>나만의 오운완 트레이너</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+</head>
+<body class="bg-gray-100 min-h-screen p-8">
+    <div class="max-w-3xl mx-auto">
+        <h1 class="text-3xl font-bold text-center mb-8">나만의 오운완 트레이너</h1>
+        
+        <!-- 운동 컨트롤 섹션 -->
+        <div class="bg-white rounded-lg shadow-lg p-6 mb-6">
+            <div class="flex justify-between items-center mb-4">
+                <button id="startBtn" class="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 transition">
+                    운동 시작
+                </button>
+                <div class="text-xl font-bold">
+                    타이머: <span id="timer">01:00</span>
+                    <div>오늘의 세션: <span id="sessionCount">0</span></div>
+                </div>
+            </div>
+
+            <!-- 카메라 및 포즈 인식 -->
+            <div class="text-center mb-4">
+                <canvas id="canvas" class="mx-auto border rounded-lg"></canvas>
+                <div id="label-container" class="mt-2 text-gray-600"></div>
+            </div>
+
+            <!-- 현재 세션 정보 -->
+            <div class="grid grid-cols-3 gap-4 text-center">
+                <div class="bg-gray-50 p-4 rounded-lg">
+                    <div class="text-gray-600">현재 개수</div>
+                    <div id="currentCount" class="text-2xl font-bold">0</div>
+                </div>
+                <div class="bg-gray-50 p-4 rounded-lg">
+                    <div class="text-gray-600">현재 세트</div>
+                    <div id="currentSet" class="text-2xl font-bold">0</div>
+                </div>
+                <div class="bg-gray-50 p-4 rounded-lg">
+                    <div class="text-gray-600">총 개수</div>
+                    <div id="totalCount" class="text-2xl font-bold">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 운동 기록 리스트 -->
+        <div class="bg-white rounded-lg shadow-lg p-6">
+            <h2 class="text-xl font-bold mb-4">오늘의 운동 기록</h2>
+            <div id="exerciseList" class="space-y-2"></div>
+        </div>
+        
+        <!-- 완료 메시지 및 오디오 -->
+        <div id="completeMessage" class="fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center hidden">
+            <h2 class="text-4xl font-bold text-white">오운완 complete 🎉</h2>
+        </div>
+        <audio id="clapSound" src="https://www.soundjay.com/button/sounds/button-29.mp3"></audio>
+    </div>
+
+    <script>
+        const URL = "https://teachablemachine.withgoogle.com/models/2jtRErntl/";
+        let model, webcam, ctx, labelContainer, maxPredictions;
+        let status = "stand";
+        let count = 0;
+        let currentSet = 0;
+        let totalCount = 0;
+        let totalSetsToday = 0;
+        let sessionCount = 0;
+        let isExercising = false;
+        let timerInterval;
+        let timeLeft = 60;
+        let lastCorrectionTime = 0;
+
+        const correctionMessages = [
+            "똑바로 하세요.",
+            "제대로 하세요.",
+            "바르게 해 볼까요?"
+        ];
+
+        const synth = window.speechSynthesis;
+        let koreanVoice = null;
+
+        function setKoreanVoice() {
+            return new Promise((resolve) => {
+                const voices = synth.getVoices();
+                const korVoice = voices.find(voice => voice.lang.includes('ko'));
+                if (korVoice) {
+                    koreanVoice = korVoice;
+                    resolve();
+                } else {
+                    synth.onvoiceschanged = () => {
+                        const voices = synth.getVoices();
+                        koreanVoice = voices.find(voice => voice.lang.includes('ko'));
+                        resolve();
+                    };
+                }
+            });
+        }
+
+        function speak(text) {
+            if (synth.speaking) {
+                synth.cancel();
+            }
+            const utterance = new SpeechSynthesisUtterance(text);
+            if (koreanVoice) {
+                utterance.voice = koreanVoice;
+            }
+            utterance.lang = 'ko-KR';
+            utterance.rate = 1.2;
+            synth.speak(utterance);
+        }
+
+        setKoreanVoice();
+
+        const startBtn = document.getElementById('startBtn');
+        const timerDisplay = document.getElementById('timer');
+        const sessionCountDisplay = document.getElementById('sessionCount');
+        const currentCountDisplay = document.getElementById('currentCount');
+        const currentSetDisplay = document.getElementById('currentSet');
+        const totalCountDisplay = document.getElementById('totalCount');
+        const exerciseList = document.getElementById('exerciseList');
+        const completeMessage = document.getElementById('completeMessage');
+        const clapSound = document.getElementById('clapSound');
+
+        startBtn.addEventListener('click', async () => {
+            if (!isExercising) {
+                await init();
+                startExercise();
+            } else {
+                stopExercise();
+            }
+        });
+
+        function startExercise() {
+            sessionCount++;
+            totalSetsToday = 0;  // 새 세션 시작 시 누적 세트 수 초기화
+            isExercising = true;
+            startBtn.textContent = '운동 중지';
+            startBtn.classList.replace('bg-blue-500', 'bg-red-500');
+            startTimer();
+            sessionCountDisplay.textContent = sessionCount; // 세션 카운트 업데이트
+        }
+
+        function stopExercise() {
+            isExercising = false;
+            startBtn.textContent = '운동 시작';
+            startBtn.classList.replace('bg-red-500', 'bg-blue-500');
+            clearInterval(timerInterval);
+
+            if (count > 0) {
+                addExerciseRecord();
+            }
+            
+            count = 0;
+            timeLeft = 60;
+            updateDisplays();
+            webcam.stop();
+        }
+
+        function startTimer() {
+            timerInterval = setInterval(() => {
+                timeLeft--;
+                const minutes = Math.floor(timeLeft / 60);
+                const seconds = timeLeft % 60;
+                timerDisplay.textContent = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+
+                if (timeLeft <= 0) {
+                    stopExercise();
+                }
+            }, 1000);
+        }
+
+        function updateDisplays() {
+            currentCountDisplay.textContent = count;
+            currentSetDisplay.textContent = Math.floor(count / 10);
+            totalCountDisplay.textContent = totalCount;
+            if (totalSetsToday >= 3) {
+                showCompleteMessage();
+                stopExercise(); // 3세트에 도달하면 운동을 즉시 중지
+            }
+        }
+
+        function addExerciseRecord() {
+            const now = new Date();
+            const timeString = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+            const sets = Math.floor(count / 10);
+            totalCount += count;
+            totalSetsToday += sets;
+
+            const recordDiv = document.createElement('div');
+            recordDiv.className = 'bg-gray-50 p-3 rounded-lg flex justify-between items-center';
+            recordDiv.innerHTML = 
+                `<span class="font-medium">${timeString}</span>
+                <span>${sets} 세트</span>
+                <span>${count}회</span>
+                `;
+            exerciseList.insertBefore(recordDiv, exerciseList.firstChild);
+            updateDisplays();
+        }
+
+        function showCompleteMessage() {
+            completeMessage.classList.remove('hidden');
+            clapSound.play();
+            setTimeout(() => {
+                completeMessage.classList.add('hidden');
+            }, 3000);
+        }
+
+        async function init() {
+            const modelURL = URL + "model.json";
+            const metadataURL = URL + "metadata.json";
+
+            model = await tmPose.load(modelURL, metadataURL);
+            maxPredictions = model.getTotalClasses();
+
+            const size = 400;
+            const flip = true;
+            webcam = new tmPose.Webcam(size, size, flip);
+            await webcam.setup();
+            await webcam.play();
+            window.requestAnimationFrame(loop);
+
+            const canvas = document.getElementById("canvas");
+            canvas.width = size;
+            canvas.height = size;
+            ctx = canvas.getContext("2d");
+            labelContainer = document.getElementById("label-container");
+            labelContainer.innerHTML = '';
+            for (let i = 0; i < maxPredictions; i++) {
+                labelContainer.appendChild(document.createElement("div"));
+            }
+        }
+
+        async function loop(timestamp) {
+            if (!isExercising) return;
+            webcam.update();
+            await predict();
+            window.requestAnimationFrame(loop);
+        }
+
+        async function predict() {
+            const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
+            const prediction = await model.predict(posenetOutput);
+
+            for (let i = 0; i < maxPredictions; i++) {
+                const classPrediction =
+                    prediction[i].className + ": " + prediction[i].probability.toFixed(2);
+                labelContainer.childNodes[i].innerHTML = classPrediction;
+            }
+
+            if (prediction[2] && prediction[2].probability.toFixed(2) > 0.90) {
+                const currentTime = Date.now();
+                if (currentTime - lastCorrectionTime > 4000) {
+                    const randomMessage = correctionMessages[Math.floor(Math.random() * correctionMessages.length)];
+                    speak(randomMessage);
+                    lastCorrectionTime = currentTime;
+                }
+            }
+
+            if (prediction[1].probability.toFixed(2) > 0.90 && status === "stand") {
+                status = "squat";
+            } else if (prediction[0].probability.toFixed(2) > 0.90 && status === "squat") {
+                status = "stand";
+                count++;
+                speak(count.toString());
+                updateDisplays();
+            }
+
+            drawPose(pose);
+        }
+
+        function drawPose(pose) {
+            if (webcam.canvas) {
+                ctx.drawImage(webcam.canvas, 0, 0);
+                if (pose) {
+                    const minPartConfidence = 0.5;
+                    tmPose.drawKeypoints(pose.keypoints, minPartConfidence, ctx);
+                    tmPose.drawSkeleton(pose.keypoints, minPartConfidence, ctx);
+                }
+            }
+        }
+    </script>
+</body>
+</html>
